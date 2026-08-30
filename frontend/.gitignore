@@ -1,5 +1,9 @@
 node_modules
+<<<<<<< HEAD
 .next
 out
 .env*.local
+=======
+dist
+>>>>>>> upstream/main
 .DS_Store
