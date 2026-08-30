@@ -1,35 +1,20 @@
 import { notFound } from "next/navigation";
-import { fetchChart, fetchCompany, fetchRisk, ApiError } from "@/lib/api";
-import TickerView from "@/components/TickerView";
-
-// Always fetch fresh — this page shows live/near-live market data.
-export const dynamic = "force-dynamic";
-
-export async function generateMetadata({ params }) {
-  try {
-    const company = await fetchCompany(params.symbol.toUpperCase());
-    return { title: `${company.ticker} \u00b7 ASTOCK` };
-  } catch {
-    return { title: "ASTOCK" };
-  }
-}
+import { getCompany, getRisk, getChartSeries } from "@/lib/mockData";
+import TickerView from "@/components/TickerView"; // adjust import path to wherever TickerView.js lives
 
 export default async function TickerPage({ params }) {
-  const ticker = params.symbol.toUpperCase();
+  const { symbol } = await params;
 
-  let company, risk, chart;
-  try {
-    [company, risk, chart] = await Promise.all([
-      fetchCompany(ticker),
-      fetchRisk(ticker),
-      fetchChart(ticker, 30),
-    ]);
-  } catch (err) {
-    if (err instanceof ApiError && err.status === 404) notFound();
-    throw err;
-  }
+  const company = getCompany(symbol);
+  if (!company) return notFound();
 
-  return (
-    <TickerView company={company} risk={risk} initialPrices={chart.prices} />
-  );
+  // Kept as Promise.all/async for structural parity with the old data-fetching
+  // page, but these all resolve synchronously from local mock data now —
+  // nothing here makes a network call.
+  const [risk, initialPrices] = await Promise.all([
+    Promise.resolve(getRisk(company.ticker)),
+    Promise.resolve(getChartSeries(company.ticker, 30)),
+  ]);
+
+  return <TickerView company={company} risk={risk} initialPrices={initialPrices} />;
 }
