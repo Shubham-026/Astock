@@ -2,11 +2,18 @@
 Thin wrapper around yfinance with:
   - a small TTL cache (yfinance scrapes Yahoo Finance under the hood and
     will start failing/slowing down if hammered)
+  - a bulk-quote path so listing many tickers costs ONE request instead
+    of one-per-ticker (the single biggest cause of 429s / the
+    "Expecting value: line 1 column 1" JSON errors you'll see if Yahoo
+    throttles or briefly blocks you)
+  - retry-with-backoff for transient rate-limit errors
   - normalization into the plain dict shapes the routes need
   - consistent errors (raises TickerNotFoundError) for bad tickers
 """
 import logging
+import random
 import threading
+import time
 
 import pandas as pd
 import yfinance as yf
@@ -38,9 +45,46 @@ _chart_cache = TTLCache(maxsize=512, ttl=CHART_CACHE_TTL)
 _profile_cache = TTLCache(maxsize=512, ttl=PROFILE_CACHE_TTL)
 _history_cache = TTLCache(maxsize=512, ttl=RISK_CACHE_TTL)
 
+# Words/phrases that show up in yfinance's various flavors of "Yahoo
+# throttled or briefly blocked us" errors. Worth a retry; most other
+# errors (bad ticker, genuinely delisted) are not.
+_TRANSIENT_MARKERS = (
+    "rate limit",
+    "too many requests",
+    "429",
+    "expecting value",
+)
+
 
 class TickerNotFoundError(Exception):
     """Raised when yfinance has no usable data for a symbol."""
+
+
+def _is_transient(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _TRANSIENT_MARKERS)
+
+
+def _with_retry(fn, *args, max_retries=3, base_delay=1.5, **kwargs):
+    """Retry fn() with exponential backoff + jitter on transient Yahoo errors."""
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if not _is_transient(exc) or attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+            logger.warning(
+                "Transient Yahoo error (attempt %d/%d), retrying in %.1fs: %s",
+                attempt + 1,
+                max_retries,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
+    raise last_exc  # pragma: no cover - unreachable, satisfies linters
 
 
 def _cached(cache: TTLCache, key):
@@ -61,7 +105,7 @@ def _get_history(ticker: str, period: str) -> pd.DataFrame:
         return hit
 
     try:
-        hist = yf.Ticker(ticker).history(period=period, auto_adjust=False)
+        hist = _with_retry(lambda: yf.Ticker(ticker).history(period=period, auto_adjust=False))
     except Exception as exc:  # noqa: BLE001 - yfinance raises assorted network/parsing errors
         logger.warning("yfinance history() failed for %s: %s", ticker, exc)
         raise TickerNotFoundError(ticker) from exc
@@ -91,6 +135,74 @@ def get_quote(ticker: str) -> dict:
     return _store(_quote_cache, key, {"price": round(price, 2), "change": round(change, 2)})
 
 
+def get_quotes_bulk(tickers: list) -> dict:
+    """
+    Fetch { TICKER: {price, change} } for many tickers at once.
+
+    This is what /api/companies and /api/companies/search should use
+    instead of calling get_quote() in a loop: yf.download() fetches every
+    symbol in ONE request instead of one request per ticker, which is by
+    far the most effective way to avoid Yahoo's rate limiting on a page
+    that lists dozens of companies.
+    """
+    results = {}
+    uncached = []
+    for t in tickers:
+        key = t.upper()
+        hit = _cached(_quote_cache, key)
+        if hit is not None:
+            results[key] = hit
+        else:
+            uncached.append(key)
+
+    if not uncached:
+        return results
+
+    try:
+        data = _with_retry(
+            lambda: yf.download(
+                uncached,
+                period="5d",
+                group_by="ticker",
+                auto_adjust=False,
+                threads=True,
+                progress=False,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Bulk quote download failed (%s), falling back to per-ticker fetches", exc)
+        data = None
+
+    if data is not None and not data.empty:
+        for t in uncached:
+            try:
+                closes = (data[t]["Close"] if len(uncached) > 1 else data["Close"]).dropna()
+                if closes.empty:
+                    continue
+                price = float(closes.iloc[-1])
+                prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else price
+                change = ((price - prev_close) / prev_close) * 100 if prev_close else 0.0
+                results[t] = _store(
+                    _quote_cache, t, {"price": round(price, 2), "change": round(change, 2)}
+                )
+            except (KeyError, IndexError):
+                continue  # this ticker just wasn't in the bulk response; fall back below
+
+    # Anything the bulk call didn't return (partial failures, single bad
+    # ticker in the batch, etc.) gets a normal per-ticker retry, with a
+    # small stagger so we don't immediately re-trigger the same limit.
+    for t in uncached:
+        if t in results:
+            continue
+        try:
+            results[t] = get_quote(t)
+        except TickerNotFoundError:
+            continue
+        time.sleep(0.15)
+
+    return results
+
+
 def get_chart(ticker: str, range_days: int) -> list:
     """Closing prices over the requested range, oldest first."""
     period = RANGE_TO_PERIOD.get(range_days)
@@ -115,16 +227,13 @@ def get_profile(ticker: str) -> dict:
         return hit
 
     try:
-        info = yf.Ticker(ticker).get_info()
+        info = _with_retry(lambda: yf.Ticker(ticker).get_info())
     except Exception as exc:  # noqa: BLE001
         logger.warning("yfinance get_info() failed for %s: %s", ticker, exc)
         info = {}
 
-    if not info or info.get("regularMarketPrice") is None and info.get("longName") is None:
-        # get_info() can return a near-empty dict for delisted/invalid symbols
-        # even when history() still returns stale rows, so double check.
-        if not info:
-            raise TickerNotFoundError(ticker)
+    if not info:
+        raise TickerNotFoundError(ticker)
 
     market_cap = info.get("marketCap")
     profile = {

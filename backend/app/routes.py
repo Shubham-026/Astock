@@ -11,8 +11,7 @@ logger = logging.getLogger("routes")
 router = APIRouter(prefix="/api")
 
 
-def _company_list_item(ticker: str, static_entry: dict | None) -> CompanyListItem:
-    quote = yf_service.get_quote(ticker)
+def _company_list_item(ticker: str, static_entry: dict | None, quote: dict) -> CompanyListItem:
     name = static_entry["name"] if static_entry else ticker.upper()
     sector = static_entry["sector"] if static_entry else "Diversified"
     return CompanyListItem(ticker=ticker.upper(), name=name, sector=sector, **quote)
@@ -20,14 +19,22 @@ def _company_list_item(ticker: str, static_entry: dict | None) -> CompanyListIte
 
 @router.get("/companies", response_model=list[CompanyListItem])
 def list_companies():
-    """The default browsable universe (curated tickers), each with a live quote."""
+    """
+    The default browsable universe (curated tickers), each with a live
+    quote. Quotes are fetched in a single bulk request (not one call per
+    ticker) - looping per-ticker here is what triggers Yahoo's rate
+    limiting on a list this size.
+    """
+    tickers = [entry["ticker"] for entry in COMPANIES]
+    quotes = yf_service.get_quotes_bulk(tickers)
+
     results = []
     for entry in COMPANIES:
-        try:
-            results.append(_company_list_item(entry["ticker"], entry))
-        except TickerNotFoundError:
+        quote = quotes.get(entry["ticker"].upper())
+        if quote is None:
             logger.warning("Skipping %s in company list: no data", entry["ticker"])
             continue
+        results.append(_company_list_item(entry["ticker"], entry, quote))
     return results
 
 
@@ -47,17 +54,19 @@ def search_companies(q: str = Query(..., min_length=1)):
     ]
 
     if matches:
+        quotes = yf_service.get_quotes_bulk([entry["ticker"] for entry in matches])
         results = []
         for entry in matches:
-            try:
-                results.append(_company_list_item(entry["ticker"], entry))
-            except TickerNotFoundError:
+            quote = quotes.get(entry["ticker"].upper())
+            if quote is None:
                 continue
+            results.append(_company_list_item(entry["ticker"], entry, quote))
         return results
 
     # Fallback: treat the query as a raw ticker symbol.
     try:
-        return [_company_list_item(needle, lookup_static(needle))]
+        quote = yf_service.get_quote(needle)
+        return [_company_list_item(needle, lookup_static(needle), quote)]
     except TickerNotFoundError:
         return []
 
