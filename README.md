@@ -52,33 +52,6 @@ Because financial datasets feature heavily imbalanced class distributions, relia
 | **MAE** | 0.2883 | Mean Absolute Error — tracks probability confidence calibration |
 | **RMSE** | 0.3876 | Root Mean Squared Error — penalizes large probability deviation errors |
 
-### Evaluation Script Snippet
-
-```python
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    mean_absolute_error, mean_squared_error
-)
-import numpy as np
-
-# Generate predictions and probability distributions
-risk_preds = risk_model.predict(X_test_risk)
-risk_probs = risk_model.predict_proba(X_test_risk)[:, 1]
-
-# Compute metrics
-metrics = {
-    "Accuracy": accuracy_score(y_test_risk, risk_preds),
-    "Precision": precision_score(y_test_risk, risk_preds, zero_division=0),
-    "Recall": recall_score(y_test_risk, risk_preds, zero_division=0),
-    "F1 Score": f1_score(y_test_risk, risk_preds, zero_division=0),
-    "MAE": mean_absolute_error(y_test_risk, risk_probs),
-    "RMSE": np.sqrt(mean_squared_error(y_test_risk, risk_probs))
-}
-
-for name, val in metrics.items():
-    print(f"{name}: {val:.4f}")
-```
-
 ---
 
 ## Tech Stack
