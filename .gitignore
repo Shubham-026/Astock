@@ -145,3 +145,6 @@ vite.config.ts.timestamp-*
 # Python virtual enviroments
 .venv/
 venv/
+
+# # Other temp files
+# frontend/       
