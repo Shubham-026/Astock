@@ -14,16 +14,26 @@ Endpoints (see app/routes.py):
     GET /api/companies/{ticker}/risk
 """
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app import refresh_service
 from app.config import CORS_ORIGINS
 from app.routes import router
 
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="Portfolio Risk API", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    refresh_service.start()
+    yield
+    refresh_service.stop()
+
+
+app = FastAPI(title="Portfolio Risk API", version="1.0.0", lifespan=lifespan)
 
 origins = ["*"] if CORS_ORIGINS == "*" else [o.strip() for o in CORS_ORIGINS.split(",")]
 app.add_middleware(

@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { fetchChart, fetchQuote } from "@/lib/api";
+import { getChartSeries, jitterQuote } from "@/lib/mockData";
 import { fmtChg, initials } from "@/lib/format";
 
 const CHART_RANGES = [
@@ -38,13 +38,13 @@ function seriesToPaths(series) {
 /**
  * @param {object} props
  * @param {object} props.company    { ticker, name, sector, summary, price, change }
- * @param {object} props.risk       shape documented in lib/api.js (fetchRisk)
+ * @param {object} props.risk       shape documented in lib/mockData.js (getRisk)
  * @param {number[]} props.initialPrices  chart series for the default 1M range
  */
 export default function TickerView({ company, risk, initialPrices }) {
   const router = useRouter();
 
-  // ---- live header price, polled from the backend --------------------------
+  // ---- live header price, simulated locally instead of polling a backend --
   const [quote, setQuote] = useState({
     price: company.price,
     change: company.change,
@@ -52,22 +52,11 @@ export default function TickerView({ company, risk, initialPrices }) {
 
   useEffect(() => {
     setQuote({ price: company.price, change: company.change });
-    let cancelled = false;
 
-    async function poll() {
-      try {
-        const q = await fetchQuote(company.ticker);
-        if (!cancelled) setQuote(q);
-      } catch {
-        // keep showing the last known quote if a poll fails
-      }
-    }
-
-    const id = setInterval(poll, QUOTE_POLL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
+    const id = setInterval(() => {
+      setQuote((prev) => jitterQuote(company.ticker, prev));
+    }, QUOTE_POLL_MS);
+    return () => clearInterval(id);
   }, [company.ticker, company.price, company.change]);
 
   // ---- chart ---------------------------------------------------------------
@@ -80,17 +69,14 @@ export default function TickerView({ company, risk, initialPrices }) {
     setSeries(initialPrices);
   }, [company.ticker, initialPrices]);
 
-  async function handleRangeClick(days) {
+  function handleRangeClick(days) {
     setRangeDays(days);
     setChartLoading(true);
-    try {
-      const { prices } = await fetchChart(company.ticker, days);
-      setSeries(prices);
-    } catch {
-      // leave the previous series showing if the fetch fails
-    } finally {
+    // simulate a brief loading state so the range switch still feels "live"
+    setTimeout(() => {
+      setSeries(getChartSeries(company.ticker, days));
       setChartLoading(false);
-    }
+    }, 150);
   }
 
   const { linePts, areaPts, up } = useMemo(
@@ -306,7 +292,7 @@ export default function TickerView({ company, risk, initialPrices }) {
         </div>
       </div>
 
-      <footer>ASTOCK &middot; live data via backend feed &middot; not investment advice</footer>
+      <footer>ASTOCK &middot; mock demo data &middot; not investment advice</footer>
     </>
   );
 }

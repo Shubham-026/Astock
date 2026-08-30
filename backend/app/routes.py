@@ -21,12 +21,12 @@ def _company_list_item(ticker: str, static_entry: dict | None, quote: dict) -> C
 def list_companies():
     """
     The default browsable universe (curated tickers), each with a live
-    quote. Quotes are fetched in a single bulk request (not one call per
-    ticker) - looping per-ticker here is what triggers Yahoo's rate
-    limiting on a list this size.
+    quote. Reads from the background-refreshed quote store (see
+    app/refresh_service.py) instead of fetching all tickers on request -
+    that's what avoids bursting Yahoo with ~40 near-simultaneous calls.
     """
     tickers = [entry["ticker"] for entry in COMPANIES]
-    quotes = yf_service.get_quotes_bulk(tickers)
+    quotes = yf_service.get_quotes_for_list(tickers)
 
     results = []
     for entry in COMPANIES:
@@ -54,7 +54,7 @@ def search_companies(q: str = Query(..., min_length=1)):
     ]
 
     if matches:
-        quotes = yf_service.get_quotes_bulk([entry["ticker"] for entry in matches])
+        quotes = yf_service.get_quotes_for_list([entry["ticker"] for entry in matches])
         results = []
         for entry in matches:
             quote = quotes.get(entry["ticker"].upper())

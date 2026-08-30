@@ -1,21 +1,32 @@
 """
-Thin wrapper around yfinance with:
-  - a small TTL cache (yfinance scrapes Yahoo Finance under the hood and
-    will start failing/slowing down if hammered)
-  - a bulk-quote path so listing many tickers costs ONE request instead
-    of one-per-ticker (the single biggest cause of 429s / the
-    "Expecting value: line 1 column 1" JSON errors you'll see if Yahoo
-    throttles or briefly blocks you)
-  - retry-with-backoff for transient rate-limit errors
-  - normalization into the plain dict shapes the routes need
-  - consistent errors (raises TickerNotFoundError) for bad tickers
+Data access layer for prices/quotes/history.
+
+Primary source is yfinance (Yahoo Finance). Because yfinance is an
+*unofficial* scraper (not a real API), Yahoo will rate-limit or
+temporarily block a client that makes too many requests in a short
+window - and once that happens, no amount of client-side retrying fixes
+it; the block can last minutes to hours regardless of code changes.
+
+To keep the app usable through that, this module:
+  1. Maintains a no-expiry "latest quote" store that a slow, steadily
+     paced background job (app/refresh_service.py) keeps warm - so
+     listing many tickers is a fast local read, not a burst of live
+     requests (bursts are exactly what trips Yahoo's rate limiter).
+  2. Retries transient errors with backoff.
+  3. Falls back to Stooq (a completely separate, unauthenticated data
+     source) for price history if Yahoo is blocking.
+  4. Falls back to the last successfully-fetched data for a ticker
+     (however old) if BOTH providers fail, so the app degrades to
+     "slightly stale" instead of "broken".
 """
+import io
 import logging
 import random
 import threading
 import time
 
 import pandas as pd
+import requests
 import yfinance as yf
 from cachetools import TTLCache
 
@@ -39,11 +50,34 @@ RANGE_TO_PERIOD = {
 # baseline, regardless of the chart range being requested elsewhere.
 RISK_HISTORY_PERIOD = "6mo"
 
+# Roughly how many trading days each yfinance-style period string covers.
+# Used to slice the Stooq fallback (which we fetch as one long series).
+_PERIOD_TRADING_DAYS = {
+    "5d": 5,
+    "3mo": 65,
+    "6mo": 130,
+    "1y": 260,
+    "2y": 520,
+}
+
 _lock = threading.Lock()
 _quote_cache = TTLCache(maxsize=512, ttl=QUOTE_CACHE_TTL)
 _chart_cache = TTLCache(maxsize=512, ttl=CHART_CACHE_TTL)
 _profile_cache = TTLCache(maxsize=512, ttl=PROFILE_CACHE_TTL)
 _history_cache = TTLCache(maxsize=512, ttl=RISK_CACHE_TTL)
+
+# No-TTL "last known good" store. Updated whenever ANY provider succeeds;
+# read only as a last resort when everything else fails, so the app can
+# serve slightly-stale data instead of erroring during a Yahoo block.
+_stale_history_store = {}
+
+# No-TTL "latest quote" store, keyed by ticker. This is what the
+# background refresher (app/refresh_service.py) writes to, and what
+# get_quotes_for_list() reads from directly - so listing many companies
+# never itself triggers a burst of live requests; it's just a fast
+# in-memory read, and freshness is managed entirely by the slow,
+# steadily-paced background loop.
+_latest_quote_store = {}
 
 # Words/phrases that show up in yfinance's various flavors of "Yahoo
 # throttled or briefly blocked us" errors. Worth a retry; most other
@@ -57,7 +91,7 @@ _TRANSIENT_MARKERS = (
 
 
 class TickerNotFoundError(Exception):
-    """Raised when yfinance has no usable data for a symbol."""
+    """Raised when no provider has usable data for a symbol."""
 
 
 def _is_transient(exc: Exception) -> bool:
@@ -65,7 +99,7 @@ def _is_transient(exc: Exception) -> bool:
     return any(marker in msg for marker in _TRANSIENT_MARKERS)
 
 
-def _with_retry(fn, *args, max_retries=3, base_delay=1.5, **kwargs):
+def _with_retry(fn, *args, max_retries=2, base_delay=1.5, **kwargs):
     """Retry fn() with exponential backoff + jitter on transient Yahoo errors."""
     last_exc = None
     for attempt in range(max_retries):
@@ -84,7 +118,7 @@ def _with_retry(fn, *args, max_retries=3, base_delay=1.5, **kwargs):
                 exc,
             )
             time.sleep(delay)
-    raise last_exc  # pragma: no cover - unreachable, satisfies linters
+    raise last_exc  # pragma: no cover
 
 
 def _cached(cache: TTLCache, key):
@@ -98,22 +132,90 @@ def _store(cache: TTLCache, key, value):
     return value
 
 
+def _store_stale(key, value):
+    with _lock:
+        _stale_history_store[key] = value
+
+
+def _get_stale(key):
+    with _lock:
+        return _stale_history_store.get(key)
+
+
+def _store_latest_quote(ticker: str, quote: dict):
+    with _lock:
+        _latest_quote_store[ticker.upper()] = quote
+
+
+def _get_latest_quote(ticker: str):
+    with _lock:
+        return _latest_quote_store.get(ticker.upper())
+
+
+# --------------------------------------------------------------------------
+# Stooq fallback - a separate, unauthenticated data source used only when
+# yfinance itself is failing (e.g. Yahoo rate limit). US tickers only.
+# --------------------------------------------------------------------------
+def _fetch_stooq_history(ticker: str) -> pd.DataFrame:
+    symbol = f"{ticker.lower()}.us"
+    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    text = resp.text
+    if not text or "Date,Open" not in text:
+        raise TickerNotFoundError(ticker)
+
+    df = pd.read_csv(io.StringIO(text), parse_dates=["Date"])
+    if df.empty or "Close" not in df.columns:
+        raise TickerNotFoundError(ticker)
+
+    df = df.set_index("Date").sort_index()
+    return df
+
+
+def _history_from_stooq(ticker: str, period: str) -> pd.DataFrame:
+    days = _PERIOD_TRADING_DAYS.get(period, 260)
+    full = _fetch_stooq_history(ticker)
+    sliced = full.tail(days)
+    if sliced.empty:
+        raise TickerNotFoundError(ticker)
+    return sliced
+
+
 def _get_history(ticker: str, period: str) -> pd.DataFrame:
     key = (ticker.upper(), period)
     hit = _cached(_history_cache, key)
     if hit is not None:
         return hit
 
+    # 1) Try Yahoo via yfinance.
     try:
         hist = _with_retry(lambda: yf.Ticker(ticker).history(period=period, auto_adjust=False))
-    except Exception as exc:  # noqa: BLE001 - yfinance raises assorted network/parsing errors
-        logger.warning("yfinance history() failed for %s: %s", ticker, exc)
-        raise TickerNotFoundError(ticker) from exc
+        if hist is not None and not hist.empty:
+            _store(_history_cache, key, hist)
+            _store_stale(key, hist)
+            return hist
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("yfinance history() failed for %s (%s): %s", ticker, period, exc)
 
-    if hist is None or hist.empty:
-        raise TickerNotFoundError(ticker)
+    # 2) Yahoo failed - try Stooq as an independent fallback source.
+    try:
+        hist = _history_from_stooq(ticker, period)
+        logger.info("Serving %s (%s) from Stooq fallback (Yahoo unavailable)", ticker, period)
+        _store(_history_cache, key, hist)
+        _store_stale(key, hist)
+        return hist
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Stooq fallback also failed for %s (%s): %s", ticker, period, exc)
 
-    return _store(_history_cache, key, hist)
+    # 3) Both providers failed - serve the last known-good data if we have
+    # any, however old, rather than erroring out entirely.
+    stale = _get_stale(key)
+    if stale is not None:
+        logger.warning("Serving STALE cached data for %s (%s) - both providers are down", ticker, period)
+        return stale
+
+    raise TickerNotFoundError(ticker)
 
 
 def get_quote(ticker: str) -> dict:
@@ -132,73 +234,41 @@ def get_quote(ticker: str) -> dict:
     prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else price
     change = ((price - prev_close) / prev_close) * 100 if prev_close else 0.0
 
-    return _store(_quote_cache, key, {"price": round(price, 2), "change": round(change, 2)})
+    quote = {"price": round(price, 2), "change": round(change, 2)}
+    _store(_quote_cache, key, quote)
+    _store_latest_quote(key, quote)  # feeds get_quotes_for_list()
+    return quote
 
 
-def get_quotes_bulk(tickers: list) -> dict:
+def get_quotes_for_list(tickers: list) -> dict:
     """
-    Fetch { TICKER: {price, change} } for many tickers at once.
+    Fast, request-time read of { TICKER: {price, change} } for many
+    tickers, sourced from the no-expiry store the background refresher
+    (app/refresh_service.py) keeps warm on a slow, steady schedule.
 
-    This is what /api/companies and /api/companies/search should use
-    instead of calling get_quote() in a loop: yf.download() fetches every
-    symbol in ONE request instead of one request per ticker, which is by
-    far the most effective way to avoid Yahoo's rate limiting on a page
-    that lists dozens of companies.
+    This deliberately does NOT fetch live data for the whole list on the
+    request path: doing that (even via yf.download, which still issues
+    one HTTP request per ticker under the hood, just concurrently) sends
+    a burst of near-simultaneous requests to Yahoo - exactly the pattern
+    that trips its rate limiter. Only tickers the background job hasn't
+    fetched yet (e.g. right after a cold start) get a synchronous,
+    slightly-paced fetch here as a one-time fallback.
     """
     results = {}
-    uncached = []
+    missing = []
     for t in tickers:
-        key = t.upper()
-        hit = _cached(_quote_cache, key)
-        if hit is not None:
-            results[key] = hit
+        quote = _get_latest_quote(t)
+        if quote is not None:
+            results[t.upper()] = quote
         else:
-            uncached.append(key)
+            missing.append(t)
 
-    if not uncached:
-        return results
-
-    try:
-        data = _with_retry(
-            lambda: yf.download(
-                uncached,
-                period="5d",
-                group_by="ticker",
-                auto_adjust=False,
-                threads=True,
-                progress=False,
-            )
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Bulk quote download failed (%s), falling back to per-ticker fetches", exc)
-        data = None
-
-    if data is not None and not data.empty:
-        for t in uncached:
-            try:
-                closes = (data[t]["Close"] if len(uncached) > 1 else data["Close"]).dropna()
-                if closes.empty:
-                    continue
-                price = float(closes.iloc[-1])
-                prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else price
-                change = ((price - prev_close) / prev_close) * 100 if prev_close else 0.0
-                results[t] = _store(
-                    _quote_cache, t, {"price": round(price, 2), "change": round(change, 2)}
-                )
-            except (KeyError, IndexError):
-                continue  # this ticker just wasn't in the bulk response; fall back below
-
-    # Anything the bulk call didn't return (partial failures, single bad
-    # ticker in the batch, etc.) gets a normal per-ticker retry, with a
-    # small stagger so we don't immediately re-trigger the same limit.
-    for t in uncached:
-        if t in results:
-            continue
+    for t in missing:
         try:
-            results[t] = get_quote(t)
+            results[t.upper()] = get_quote(t)
         except TickerNotFoundError:
             continue
-        time.sleep(0.15)
+        time.sleep(0.15)  # cold-start only; keeps this rare path gentle too
 
     return results
 
@@ -220,7 +290,13 @@ def get_chart(ticker: str, range_days: int) -> list:
 
 
 def get_profile(ticker: str) -> dict:
-    """{ name, sector, summary, marketCapB } sourced from yfinance's info payload."""
+    """
+    { name, sector, summary, marketCapB } sourced from yfinance's info
+    payload. This hits a heavier/more rate-limited Yahoo endpoint than
+    price history, so failures here degrade gracefully (generic summary,
+    null market cap) rather than raising - callers still get a usable
+    company detail response even if this specific call is blocked.
+    """
     key = ticker.upper()
     hit = _cached(_profile_cache, key)
     if hit is not None:
@@ -233,7 +309,13 @@ def get_profile(ticker: str) -> dict:
         info = {}
 
     if not info:
-        raise TickerNotFoundError(ticker)
+        degraded = {
+            "name": ticker.upper(),
+            "sector": "Diversified",
+            "summary": "Company summary is temporarily unavailable.",
+            "marketCapB": None,
+        }
+        return degraded  # not cached - so we retry properly once Yahoo recovers
 
     market_cap = info.get("marketCap")
     profile = {

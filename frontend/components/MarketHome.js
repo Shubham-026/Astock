@@ -3,8 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { fetchCompanies, searchCompanies } from "@/lib/api";
-import { fetchAllowedTickers } from "@/lib/tickers";
+import { COMPANIES, searchCompaniesLocal, jitterQuote } from "@/lib/mockData";
 import { fmtChg, initials } from "@/lib/format";
 
 const QUOTE_POLL_MS = 4000;
@@ -12,47 +11,18 @@ const QUOTE_POLL_MS = 4000;
 export default function MarketHome() {
   const router = useRouter();
 
-  const [companies, setCompanies] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
+  // ---- company list, seeded from mock data and "live" jittered in place ---
+  const [companies, setCompanies] = useState(COMPANIES);
+  const loading = false;
+  const error = null;
 
-  // ---- allowed-ticker whitelist from /public/ticker.txt --------------------
-  // null = not loaded yet / file missing (fail open, no restriction)
-  // array = only these tickers are searchable
-  const [allowedTickers, setAllowedTickers] = useState(null);
   useEffect(() => {
-    fetchAllowedTickers().then(setAllowedTickers);
-  }, []);
-
-  function isSearchable(ticker) {
-    if (!allowedTickers) return true;
-    return allowedTickers.includes(ticker.toUpperCase());
-  }
-
-  // ---- initial load + live polling ---------------------------------------
-  useEffect(() => {
-    let cancelled = false;
-
-    async function load() {
-      try {
-        const data = await fetchCompanies();
-        if (!cancelled) {
-          setCompanies(data);
-          setError(null);
-        }
-      } catch (err) {
-        if (!cancelled) setError(err);
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    }
-
-    load();
-    const id = setInterval(load, QUOTE_POLL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
+    const id = setInterval(() => {
+      setCompanies((prev) =>
+        prev.map((c) => ({ ...c, ...jitterQuote(c.ticker, c) }))
+      );
+    }, QUOTE_POLL_MS);
+    return () => clearInterval(id);
   }, []);
 
   // ---- search bar ---------------------------------------------------------
@@ -62,21 +32,12 @@ export default function MarketHome() {
   const wrapRef = useRef(null);
 
   useEffect(() => {
-    let cancelled = false;
     if (!query.trim()) {
       setMatches([]);
       return;
     }
-    searchCompanies(query, companies).then((res) => {
-      if (!cancelled) {
-        setMatches(res.filter((c) => isSearchable(c.ticker)));
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query, companies, allowedTickers]);
+    setMatches(searchCompaniesLocal(query, companies));
+  }, [query, companies]);
 
   function jumpTo(ticker) {
     router.push(`/ticker/${ticker}`);
@@ -102,7 +63,7 @@ export default function MarketHome() {
             c.ticker.toUpperCase().includes(q) ||
             c.name.toUpperCase().includes(q)
         );
-      if (match && isSearchable(match.ticker)) jumpTo(match.ticker);
+      if (match) jumpTo(match.ticker);
       setSuggestOpen(false);
     }
   }
@@ -242,7 +203,7 @@ export default function MarketHome() {
         {loading && <p style={{ textAlign: "center", color: "var(--mist)" }}>Loading market data…</p>}
         {error && !loading && (
           <p style={{ textAlign: "center", color: "var(--down)" }}>
-            Couldn&apos;t reach the backend at {process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000"}.
+            Couldn&apos;t reach the backend.
           </p>
         )}
 
@@ -269,7 +230,7 @@ export default function MarketHome() {
         </div>
       </section>
 
-      <footer>ASTOCK &middot; live data via backend feed &middot; not investment advice</footer>
+      <footer>ASTOCK &middot; mock demo data &middot; not investment advice</footer>
     </>
   );
 }
