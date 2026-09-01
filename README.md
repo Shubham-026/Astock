@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.jpeg" alt="Astock logo" width="200"/>
+</p>
+
 # Astock: Machine Learning & Portfolio Risk Intelligence Engine
 
 An advanced financial machine learning pipeline engineered to predict market direction and assess portfolio risk states. This repository houses quantitative models designed to provide robust, leak-free risk classification and trend forecasting for modern trading workflows.
@@ -51,6 +55,34 @@ Because financial datasets feature heavily imbalanced class distributions, relia
 | **Accuracy** | 78.46% | Baseline measure, evaluated alongside precision to account for class imbalance |
 | **MAE** | 0.2883 | Mean Absolute Error — tracks probability confidence calibration |
 | **RMSE** | 0.3876 | Root Mean Squared Error — penalizes large probability deviation errors |
+
+---
+
+## Visualizations
+
+### Confusion Matrix
+
+<p align="center">
+  <img src="assets/confusionMatrix.jpeg" alt="Portfolio Risk Model confusion matrix" width="500"/>
+</p>
+
+This shows how the risk model's predictions line up against actual market states on the held-out test set. The model correctly identifies the large majority of low-risk periods (73,366 true negatives) and catches a meaningful share of high-risk periods (8,425 true positives), but it also misses a substantial number of genuinely high-risk states (21,811 false negatives). This pattern is consistent with the low recall reported in the metrics table above: the model would rather stay quiet than risk a false alarm, so it under-flags risk more often than it over-flags it.
+
+### Feature Importance
+
+<p align="center">
+  <img src="assets/featureImportance.jpeg" alt="Risk model feature importance" width="600"/>
+</p>
+
+This chart ranks how much each input feature contributes to the risk model's decisions. `Price_to_MA20` (price relative to its 20-day moving average) is the strongest driver, followed by `Volume`, with `Daily_Return` contributing the least. In other words, the model leans most heavily on how far a stock has drifted from its recent trend, rather than on the size of any single day's move.
+
+### Precision-Recall Curve
+
+<p align="center">
+  <img src="assets/recallGraph.jpeg" alt="Precision-recall curve for the portfolio risk calculator" width="500"/>
+</p>
+
+This curve shows the trade-off between precision and recall as the model's decision threshold is varied, which is a more informative view than accuracy alone given the class imbalance between high- and low-risk states. Precision stays high (often above 0.7) through low-to-moderate recall before degrading, and the average precision (AP) of 0.66 summarizes that trade-off across all thresholds. It confirms that the model can be tuned toward either "catch more risk events" or "raise fewer false alarms," depending on the operating threshold chosen downstream.
 
 ---
 
